@@ -39,6 +39,8 @@ const env = {
   port: parseInt(process.env.PORT, 10),
   mongodbUri: process.env.MONGODB_URI,
 
+  storageProvider: process.env.STORAGE_PROVIDER || "cloudinary",
+
   cloudinary: {
     cloudName: process.env.CLOUDINARY_CLOUD_NAME,
     apiKey: process.env.CLOUDINARY_API_KEY,
