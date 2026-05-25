@@ -45,6 +45,8 @@ const env = {
     cloudName: process.env.CLOUDINARY_CLOUD_NAME,
     apiKey: process.env.CLOUDINARY_API_KEY,
     apiSecret: process.env.CLOUDINARY_API_SECRET,
+    uploadFolder: process.env.CLOUDINARY_UPLOAD_FOLDER || "vaultshare",
+    signatureExpirySeconds: 3600,
   },
 
   // How long a signed delivery URL stays valid (seconds)

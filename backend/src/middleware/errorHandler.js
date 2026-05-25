@@ -103,6 +103,8 @@ function errorHandler(err, req, res, next) {
         code: err.code,
         message: err.message,
         statusCode: err.statusCode,
+        // Include validation details if present (set by validate middleware)
+        ...(err.details && { details: err.details }),
       },
     });
   }

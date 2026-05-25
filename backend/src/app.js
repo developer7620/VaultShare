@@ -10,6 +10,7 @@ const { generalLimiter } = require("./middleware/rateLimiter");
 const errorHandler = require("./middleware/errorHandler");
 const healthRoutes = require("./routes/health.routes");
 const AppError = require("./utils/AppError");
+const fileRoutes = require("./routes/file.routes");
 
 const app = express();
 
@@ -67,6 +68,7 @@ if (process.env.NODE_ENV !== "test") {
 
 // ─── 6. API routes ─────────────────────────────────────────────────────────
 app.use("/health", healthRoutes);
+app.use("/api/files", fileRoutes);
 
 // Placeholder — file routes added Day 4
 // app.use('/api/files', fileRoutes);

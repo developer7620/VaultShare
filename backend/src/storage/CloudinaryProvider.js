@@ -71,27 +71,21 @@ class CloudinaryProvider extends StorageProvider {
    */
   async generateUploadSignature(options = {}) {
     const { maxBytes = 104_857_600 } = options;
-
-    // Unix timestamp — Cloudinary rejects signatures older than 1 hour
     const timestamp = Math.round(Date.now() / 1000);
 
-    // Parameters to include in the signature.
-    // MUST be sorted alphabetically — this is Cloudinary's canonical form requirement.
-    // Adding or removing a param here requires adding/removing it from the client too.
+    // ONLY these params go into the signature string
+    // resource_type and type are sent as form fields but Cloudinary
+    // only signs: folder, timestamp, type (delivery type, not resource_type)
     const paramsToSign = {
       folder: this._folder,
       timestamp,
-      // 'raw' resource type accepts any file format
-      // Client must send resource_type: 'raw' in the upload request
-      resource_type: "raw",
-      // 'private' type makes the file inaccessible without a signed URL
       type: "private",
+      // resource_type is NOT signed — remove it from here
     };
 
     const signature = this._generateSignature(paramsToSign);
 
     return {
-      // Credentials the client needs
       signature,
       timestamp,
       apiKey: this._apiKey,
@@ -99,9 +93,7 @@ class CloudinaryProvider extends StorageProvider {
       folder: this._folder,
       resourceType: "raw",
       uploadType: "private",
-      // Upload URL — client POSTs directly here
       uploadUrl: `https://api.cloudinary.com/v1_1/${this._cloudName}/raw/upload`,
-      // Let the client know the file size limit
       maxBytes,
     };
   }
