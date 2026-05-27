@@ -54,10 +54,17 @@ const download = asyncHandler(async (req, res) => {
 });
 
 const deleteFile = asyncHandler(async (req, res) => {
-  await fileService.softDeleteFile(req.params.id);
+  const { id } = req.params;
+
+  // uploadToken is set by extractToken middleware (null if not provided)
+  await fileService.softDeleteFile(id, req.uploadToken);
+
   res.status(200).json({
     success: true,
-    data: { message: "File deleted successfully.", fileId: req.params.id },
+    data: {
+      message: "File deleted successfully.",
+      fileId: id,
+    },
   });
 });
 

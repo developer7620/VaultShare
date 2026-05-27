@@ -16,6 +16,9 @@ const File = require("../models/File.model");
 const storage = require("../storage");
 const AppError = require("../utils/AppError");
 const env = require("../config/env");
+const { generateUploadToken, verifyUploadToken } = require("../utils/token");
+const attemptTracker = require("../utils/attemptTracker");
+const { hashIp } = require("../utils/hash");
 
 // ─── Upload flow ───────────────────────────────────────────────────────────
 
@@ -79,6 +82,7 @@ async function generateUploadCredentials({
  * @param {Date|null}   params.expiresAt
  * @returns {Promise<Object>} Created file summary
  */
+
 async function registerFile({
   storageKey,
   originalName,
@@ -88,9 +92,7 @@ async function registerFile({
   maxDownloads,
   expiresAt,
 }) {
-  // ── Step 1: Validate the storageKey format ────────────────────────────────
-  // Must start with our configured folder prefix.
-  // This is a cheap local check before making a Cloudinary API call.
+  // ── Step 1: Validate storageKey format ────────────────────────────────
   const expectedPrefix = env.cloudinary.uploadFolder + "/";
   if (!storageKey.startsWith(expectedPrefix)) {
     throw AppError.badRequest(
@@ -99,25 +101,22 @@ async function registerFile({
     );
   }
 
-  // ── Step 2: Verify the file exists in Cloudinary ──────────────────────────
-  // This is the security-critical check. It calls Cloudinary's API to confirm:
-  //   - The public_id exists in our account
-  //   - It has the correct resource_type (raw) and delivery type (private)
-  //
-  // Without this, clients could register public_ids they don't own,
-  // or IDs from publicly accessible uploads.
+  // ── Step 2: Verify file exists in Cloudinary ──────────────────────────
   await verifyStorageKeyExists(storageKey);
 
-  // ── Step 3: Hash password if provided ────────────────────────────────────
+  // ── Step 3: Hash password if provided ────────────────────────────────
   let passwordHash = null;
   const isPasswordProtected = Boolean(password && password.length > 0);
-
   if (isPasswordProtected) {
-    // bcrypt with configured cost factor (10 in dev, 12 in production)
     passwordHash = await bcrypt.hash(password, env.bcryptRounds);
   }
 
-  // ── Step 4: Create File document ─────────────────────────────────────────
+  // ── Step 4: Generate upload token ────────────────────────────────────
+  // Generated for every file — required for deletion.
+  // plaintext is returned to client once. hash is stored in DB.
+  const { plaintext: uploadToken, hash: uploadTokenHash } = await generateUploadToken();
+
+  // ── Step 5: Create File document ─────────────────────────────────────
   const file = await File.create({
     storageKey,
     storageProvider: storage.getName(),
@@ -126,17 +125,19 @@ async function registerFile({
     sizeBytes,
     passwordHash,
     isPasswordProtected,
-    // downloadsRemaining mirrors maxDownloads on creation
+    uploadTokenHash, // ← stored, never returned directly
     maxDownloads: maxDownloads || null,
     downloadsRemaining: maxDownloads || null,
     expiresAt: expiresAt || null,
     status: "active",
   });
 
-  // ── Step 5: Return summary (never the full document) ─────────────────────
-  // toJSON() transform strips passwordHash and downloads array automatically
+  // ── Step 6: Return summary including plaintext token ─────────────────
+  // uploadToken is returned ONCE here and never again.
+  // If the user loses it, they cannot delete the file — by design.
   return {
     fileId: file._id,
+    uploadToken, // ← plaintext, shown once
     shareUrl: buildShareUrl(file._id),
     originalName: file.originalName,
     mimeType: file.mimeType,
@@ -249,64 +250,84 @@ async function getFileMeta(fileId) {
  * @returns {Promise<Object>} { signedUrl, originalName, mimeType, downloadsRemaining }
  */
 async function downloadFile({ fileId, password, ipAddress, userAgent }) {
-  // ── Step 1: Fetch file ────────────────────────────────────────────────────
-  const file = await File.findByIdActive(fileId);
+  const ipHash = hashIp(ipAddress);
 
+  // ── Step 1: Check brute-force lockout BEFORE any DB query ────────────
+  // Cheapest check first — no DB round trip needed to enforce a lockout.
+  const lockStatus = attemptTracker.isLocked(fileId, ipHash);
+  if (lockStatus.locked) {
+    const remainingMinutes = Math.ceil(lockStatus.remainingMs / 60000);
+    throw AppError.tooManyRequests(
+      `Too many failed attempts. Try again in ${remainingMinutes} minute(s).`,
+    );
+  }
+
+  // ── Step 2: Fetch file ────────────────────────────────────────────────
+  const file = await File.findByIdActive(fileId);
   if (!file) {
     throw AppError.notFound(
       "File not found. It may have expired or been deleted.",
     );
   }
 
-  // ── Step 2: Access gate ───────────────────────────────────────────────────
+  // ── Step 3: Access gate ───────────────────────────────────────────────
   const { allowed, reason } = file.canBeDownloaded();
   if (!allowed) {
-    // Map internal reason codes to user-facing messages without leaking state
     const message =
       reason === "DOWNLOAD_LIMIT_REACHED"
         ? "This file has reached its download limit."
         : "File not found. It may have expired or been deleted.";
-
     throw AppError.notFound(message);
   }
 
-  // ── Step 3: Password verification (timing-safe) ───────────────────────────
-  await verifyPassword(file, password);
+  // ── Step 4: Password verification with attempt tracking ───────────────
+  try {
+    await verifyPassword(file, password);
+  } catch (err) {
+    // Password was wrong — record the failure
+    if (file.isPasswordProtected) {
+      const result = attemptTracker.recordFailure(fileId, ipHash);
 
-  // ── Step 4: Atomic decrement ──────────────────────────────────────────────
-  // This is the ONLY place downloadsRemaining is decremented.
-  // If this returns null, a concurrent request beat us to the last download.
+      if (result.locked) {
+        // Just got locked out on this attempt
+        throw AppError.tooManyRequests(
+          `Too many failed attempts. Account locked for 15 minutes.`,
+        );
+      }
+
+      // Tell the user how many attempts remain before lockout
+      throw AppError.unauthorized(
+        `Incorrect password. ${result.attemptsRemaining} attempt(s) remaining.`,
+      );
+    }
+    throw err;
+  }
+
+  // ── Step 5: Reset attempt counter on success ──────────────────────────
+  if (file.isPasswordProtected) {
+    attemptTracker.resetAttempts(fileId, ipHash);
+  }
+
+  // ── Step 6: Atomic decrement ──────────────────────────────────────────
   const updatedFile = await atomicDecrementDownload(fileId);
-
   if (!updatedFile) {
-    // Race condition: another request consumed the last download between
-    // our check (Step 2) and our decrement (Step 4). This is correct
-    // behaviour — the limit is honoured.
     throw AppError.notFound("This file has reached its download limit.");
   }
 
-  // ── Step 5: Audit logging ─────────────────────────────────────────────────
-  // Runs AFTER the decrement so the audit is only for successful downloads.
-  // Fire-and-forget — don't await, don't let audit failures block the response.
+  // ── Step 7: Audit logging (fire and forget) ───────────────────────────
   logDownload(updatedFile, ipAddress, userAgent).catch((err) => {
-    // Log but don't fail the request — audit is observability, not a gate
     console.error("[FileService] Audit log failed:", err.message);
   });
 
-  // ── Step 6: Generate signed delivery URL ──────────────────────────────────
-  // Uses the storageProvider field on the document to pick the right provider.
-  // During Cloudinary → S3 migration, old files use CloudinaryProvider,
-  // new files use S3Provider. The controller doesn't know which.
+  // ── Step 8: Generate signed URL ───────────────────────────────────────
   const signedUrl = await generateDeliveryUrl(updatedFile);
 
   return {
     signedUrl,
     originalName: updatedFile.originalName,
     mimeType: updatedFile.mimeType,
-    // Return the updated remaining count for the client to display
     downloadsRemaining:
       updatedFile.maxDownloads !== null ? updatedFile.downloadsRemaining : null,
-    // How long the signed URL is valid — client should start download immediately
     urlExpiresInSeconds: env.signedUrlTtlSeconds,
   };
 }
@@ -325,11 +346,13 @@ async function downloadFile({ fileId, password, ipAddress, userAgent }) {
  *   2. Delete from Cloudinary
  *   3. Clear storageKey
  *
+/**
+ * softDeleteFile — now requires upload token verification.
+ *
  * @param {string} fileId
- * @returns {Promise<void>}
+ * @param {string} uploadToken - Plaintext token from Authorization header
  */
-async function softDeleteFile(fileId) {
-  // Find the file regardless of status — allow deleting already-expired files
+async function softDeleteFile(fileId, uploadToken) {
   const file = await File.findById(fileId);
 
   if (!file) {
@@ -337,34 +360,39 @@ async function softDeleteFile(fileId) {
   }
 
   if (file.status === "deleted") {
-    // Idempotent — deleting an already-deleted file is a no-op
-    return;
+    return; // Idempotent
   }
 
-  // Step 1: Mark deleted in MongoDB (source of truth)
+  // ── Verify upload token ───────────────────────────────────────────────
+  // Files created before Day 7 have no uploadTokenHash — allow deletion
+  // without token for backward compatibility (remove this in production).
+  if (file.uploadTokenHash) {
+    const isValid = await verifyUploadToken(uploadToken, file.uploadTokenHash);
+    if (!isValid) {
+      throw AppError.unauthorized(
+        "Invalid upload token. Only the original uploader can delete this file.",
+      );
+    }
+  }
+
+  // ── Mark deleted ──────────────────────────────────────────────────────
   await File.updateOne({ _id: fileId }, { $set: { status: "deleted" } });
 
-  // Step 2: Delete from storage (best-effort — failure doesn't block response)
-  // If this fails, the expiry cron job will clean it up on the next retry pass
-  // because expired/deleted files with storageKey set are retried.
+  // ── Delete from storage ───────────────────────────────────────────────
   if (file.storageKey) {
     try {
-      const CloudinaryProvider = require("../storage/CloudinaryProvider");
-      const S3Provider = require("../storage/S3Provider");
-
       let provider;
       if (file.storageProvider === "cloudinary") {
+        const CloudinaryProvider = require("../storage/CloudinaryProvider");
         provider = new CloudinaryProvider();
       } else {
+        const S3Provider = require("../storage/S3Provider");
         provider = new S3Provider();
       }
 
       await provider.deleteFile(file.storageKey);
-
-      // Step 3: Clear storageKey — confirms storage deletion
       await File.updateOne({ _id: fileId }, { $set: { storageKey: null } });
     } catch (err) {
-      // Log but don't fail — MongoDB is already updated, cron will retry storage
       console.error(
         `[FileService] Storage deletion failed for ${fileId}:`,
         err.message,

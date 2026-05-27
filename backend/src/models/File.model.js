@@ -100,6 +100,11 @@ const fileSchema = new Schema(
       index: true,
     },
 
+    uploadTokenHash: {
+      type: String,
+      default: null,
+    },
+
     // ── Download limits ──────────────────────────────────────────────────────
     // null = unlimited downloads
     maxDownloads: {
@@ -170,6 +175,7 @@ const fileSchema = new Schema(
         delete ret.passwordHash;
         // Remove the raw downloads audit array from public responses
         // (available via a separate admin endpoint if needed)
+        delete ret.uploadTokenHash;
         delete ret.downloads;
         // Remove mongoose internals
         delete ret.__v;
