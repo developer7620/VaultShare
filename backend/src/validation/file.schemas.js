@@ -142,9 +142,31 @@ const registerFileSchema = Joi.object({
     }),
 });
 
+/**
+ * Add to file.schemas.js — below existing schemas
+ */
+
+/**
+ * Schema for POST /api/files/:id/download
+ *
+ * Password is optional because not all files are protected.
+ * We always send it through to the service — the service decides
+ * whether it's required and whether it matches.
+ *
+ * We do NOT validate the ObjectId format here — MongoDB's own
+ * CastError (caught in errorHandler) gives a better message than
+ * a Joi regex match, and avoids duplicating the ID format spec.
+ */
+const downloadFileSchema = Joi.object({
+  password: Joi.string().max(128).optional().allow(null, "").messages({
+    "string.max": "Password exceeds maximum length",
+  }),
+});
+
 module.exports = {
   signUploadSchema,
   registerFileSchema,
+  downloadFileSchema, // ← add to exports
   ALLOWED_MIME_TYPES,
   MAX_FILE_SIZE_BYTES,
 };

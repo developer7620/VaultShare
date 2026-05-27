@@ -79,4 +79,66 @@ const register = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { sign, register };
+/**
+ * Add to file.controller.js — below existing sign and register controllers
+ */
+
+/**
+ * GET /api/files/:id
+ *
+ * Returns public file metadata for the download page.
+ * No authentication required — reveals only non-sensitive fields.
+ * Does NOT generate a signed URL or decrement any counter.
+ *
+ * Request params: { id: MongoDB ObjectId }
+ * Response: { fileId, originalName, mimeType, sizeBytes,
+ *             isPasswordProtected, downloadsRemaining, expiresAt }
+ */
+const getMeta = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const result = await fileService.getFileMeta(id);
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+});
+
+/**
+ * POST /api/files/:id/download
+ *
+ * Verifies access (password, limits, expiry) and returns a short-lived
+ * signed URL. Atomically decrements the download counter.
+ *
+ * Request params: { id: MongoDB ObjectId }
+ * Request body:   { password?: string }
+ * Response:       { signedUrl, originalName, mimeType,
+ *                   downloadsRemaining, urlExpiresInSeconds }
+ */
+const download = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { password } = req.body;
+
+  // Extract client IP for audit logging.
+  // req.ip respects Express's 'trust proxy' setting.
+  // In production behind a load balancer, set app.set('trust proxy', 1)
+  // and req.ip will return the real client IP from X-Forwarded-For.
+  const ipAddress = req.ip || req.socket?.remoteAddress || "unknown";
+  const userAgent = req.headers["user-agent"] || "";
+
+  const result = await fileService.downloadFile({
+    fileId: id,
+    password: password || null,
+    ipAddress,
+    userAgent,
+  });
+
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+});
+
+// Update module.exports to include new controllers:
+module.exports = { sign, register, getMeta, download };

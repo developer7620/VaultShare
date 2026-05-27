@@ -14,6 +14,8 @@ const fileRoutes = require("./routes/file.routes");
 
 const app = express();
 
+app.set("trust proxy", 1);
+
 // ─── 1. Request ID (first — threads through all logs) ──────────────────────
 app.use(requestId);
 

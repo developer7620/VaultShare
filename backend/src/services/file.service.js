@@ -149,6 +149,327 @@ async function registerFile({
   };
 }
 
+/**
+ * file.service.js — add to existing file, below registerFile
+ *
+ * New exports added today:
+ *   - getFileMeta      → GET /api/files/:id
+ *   - downloadFile     → POST /api/files/:id/download
+ */
+
+/**
+ * Dummy bcrypt hash used for timing-attack-resistant password comparisons.
+ *
+ * When a file has no password, we still run bcrypt.compare() against this
+ * dummy hash so the response time is identical to a file that does have a
+ * password. Without this, an attacker can detect "no password" vs
+ * "wrong password" by measuring response latency.
+ *
+ * The hash is for the string "dummy" at cost factor 12.
+ * It must be a valid bcrypt hash — bcrypt.compare() validates format.
+ */
+const DUMMY_HASH =
+  "$2b$12$LIxGCHaJ9SmhIkWsVxNdOeXPdSiGGfJj1z5Xv2V8k9Y3mR7nQpWuC";
+
+// ─── Download flow ─────────────────────────────────────────────────────────
+
+/**
+ * getFileMeta
+ *
+ * Returns public metadata about a file without triggering a download.
+ * Used by the frontend to render the download page.
+ *
+ * Deliberately omits: passwordHash, downloads audit array, storageKey.
+ * Includes: whether a password is required (so the UI shows the input).
+ *
+ * Returns the same 404 whether the file doesn't exist OR is expired/deleted.
+ * This prevents enumeration: an attacker can't distinguish "never existed"
+ * from "existed but expired" by probing IDs.
+ *
+ * @param {string} fileId - MongoDB ObjectId string
+ * @returns {Promise<Object>} Public file metadata
+ */
+async function getFileMeta(fileId) {
+  // findByIdActive only returns status: 'active' files
+  const file = await File.findByIdActive(fileId);
+
+  if (!file) {
+    throw AppError.notFound(
+      "File not found. It may have expired or been deleted.",
+    );
+  }
+
+  // Check expiry and limit using the model's instance method.
+  // Even if status is 'active', the file might have passed its expiresAt
+  // (the cron job hasn't run yet). The virtual isExpired handles this gap.
+  const { allowed, reason } = file.canBeDownloaded();
+  if (!allowed) {
+    throw AppError.notFound(
+      "File not found. It may have expired or been deleted.",
+    );
+    // Note: we return 404 (not 410 Gone) even for expired files.
+    // 410 would confirm the file existed, enabling enumeration.
+    // 404 is deliberately ambiguous.
+  }
+
+  return {
+    fileId: file._id,
+    originalName: file.originalName,
+    mimeType: file.mimeType,
+    sizeBytes: file.sizeBytes,
+    humanReadableSize: file.humanReadableSize,
+    isPasswordProtected: file.isPasswordProtected,
+    // Show remaining downloads if there's a limit — UX decision
+    downloadsRemaining:
+      file.maxDownloads !== null ? file.downloadsRemaining : null,
+    maxDownloads: file.maxDownloads,
+    expiresAt: file.expiresAt,
+    createdAt: file.createdAt,
+  };
+}
+
+/**
+ * downloadFile
+ *
+ * The most security-critical service method in VaultShare.
+ *
+ * Sequence (ORDER IS LOAD-BEARING — do not reorder):
+ *   1. Fetch file with status check
+ *   2. canBeDownloaded() gate
+ *   3. Password verification (timing-safe)
+ *   4. Atomic decrement (the point of no return)
+ *   5. Audit logging
+ *   6. Signed URL generation
+ *
+ * @param {Object} params
+ * @param {string}      params.fileId       - MongoDB ObjectId string
+ * @param {string|null} params.password     - Plain text password from client
+ * @param {string}      params.ipAddress    - Raw IP for hashing
+ * @param {string}      params.userAgent    - User-Agent header
+ * @returns {Promise<Object>} { signedUrl, originalName, mimeType, downloadsRemaining }
+ */
+async function downloadFile({ fileId, password, ipAddress, userAgent }) {
+  // ── Step 1: Fetch file ────────────────────────────────────────────────────
+  const file = await File.findByIdActive(fileId);
+
+  if (!file) {
+    throw AppError.notFound(
+      "File not found. It may have expired or been deleted.",
+    );
+  }
+
+  // ── Step 2: Access gate ───────────────────────────────────────────────────
+  const { allowed, reason } = file.canBeDownloaded();
+  if (!allowed) {
+    // Map internal reason codes to user-facing messages without leaking state
+    const message =
+      reason === "DOWNLOAD_LIMIT_REACHED"
+        ? "This file has reached its download limit."
+        : "File not found. It may have expired or been deleted.";
+
+    throw AppError.notFound(message);
+  }
+
+  // ── Step 3: Password verification (timing-safe) ───────────────────────────
+  await verifyPassword(file, password);
+
+  // ── Step 4: Atomic decrement ──────────────────────────────────────────────
+  // This is the ONLY place downloadsRemaining is decremented.
+  // If this returns null, a concurrent request beat us to the last download.
+  const updatedFile = await atomicDecrementDownload(fileId);
+
+  if (!updatedFile) {
+    // Race condition: another request consumed the last download between
+    // our check (Step 2) and our decrement (Step 4). This is correct
+    // behaviour — the limit is honoured.
+    throw AppError.notFound("This file has reached its download limit.");
+  }
+
+  // ── Step 5: Audit logging ─────────────────────────────────────────────────
+  // Runs AFTER the decrement so the audit is only for successful downloads.
+  // Fire-and-forget — don't await, don't let audit failures block the response.
+  logDownload(updatedFile, ipAddress, userAgent).catch((err) => {
+    // Log but don't fail the request — audit is observability, not a gate
+    console.error("[FileService] Audit log failed:", err.message);
+  });
+
+  // ── Step 6: Generate signed delivery URL ──────────────────────────────────
+  // Uses the storageProvider field on the document to pick the right provider.
+  // During Cloudinary → S3 migration, old files use CloudinaryProvider,
+  // new files use S3Provider. The controller doesn't know which.
+  const signedUrl = await generateDeliveryUrl(updatedFile);
+
+  return {
+    signedUrl,
+    originalName: updatedFile.originalName,
+    mimeType: updatedFile.mimeType,
+    // Return the updated remaining count for the client to display
+    downloadsRemaining:
+      updatedFile.maxDownloads !== null ? updatedFile.downloadsRemaining : null,
+    // How long the signed URL is valid — client should start download immediately
+    urlExpiresInSeconds: env.signedUrlTtlSeconds,
+  };
+}
+
+// ─── Private helpers ───────────────────────────────────────────────────────
+
+/**
+ * verifyPassword
+ *
+ * Timing-safe password verification.
+ *
+ * Always runs bcrypt.compare() regardless of whether the file is password
+ * protected. This ensures identical response times for:
+ *   - Correct password
+ *   - Wrong password
+ *   - No password required (dummy comparison)
+ *   - No password provided but required
+ *
+ * This eliminates timing side-channels that would reveal file state.
+ *
+ * @param {import('../models/File.model')} file
+ * @param {string|null|undefined} providedPassword
+ */
+async function verifyPassword(file, providedPassword) {
+  // Use the real hash if it exists, dummy hash otherwise.
+  // bcrypt.compare() takes ~250ms either way.
+  const hashToCompare = file.passwordHash || DUMMY_HASH;
+
+  // Always compare something — never short-circuit before bcrypt runs
+  const candidatePassword = providedPassword || "";
+  const isMatch = await bcrypt.compare(candidatePassword, hashToCompare);
+
+  // Three states that all result in rejection:
+  //   1. File requires password, wrong password provided
+  //   2. File requires password, no password provided
+  //   3. (File has no password — isMatch will be false with dummy hash,
+  //      but isPasswordProtected is also false, so we don't throw)
+  if (file.isPasswordProtected && !isMatch) {
+    throw AppError.unauthorized("Incorrect password.");
+  }
+
+  // If file is not password protected, we don't care about isMatch.
+  // The dummy comparison already ran — timing is preserved.
+}
+
+/**
+ * atomicDecrementDownload
+ *
+ * Single MongoDB operation that:
+ *   1. Finds the file by ID with status 'active'
+ *   2. Verifies downloadsRemaining > 0 OR is null (unlimited)
+ *   3. Decrements downloadsRemaining by 1 (skipped if null — unlimited)
+ *
+ * Returns the updated document (new: true) or null if the filter didn't match.
+ * A null result means either the file doesn't exist OR the limit was just hit.
+ *
+ * CRITICAL: This uses findOneAndUpdate, not findById + save().
+ * The filter and update are atomic — no other operation can interleave.
+ *
+ * @param {string} fileId
+ * @returns {Promise<import('../models/File.model')|null>}
+ */
+async function atomicDecrementDownload(fileId) {
+  // First attempt: limited file with remaining downloads
+  const limitedResult = await File.findOneAndUpdate(
+    {
+      _id: fileId,
+      status: "active",
+      maxDownloads: { $ne: null }, // has a limit
+      downloadsRemaining: { $gt: 0 }, // has remaining
+    },
+    { $inc: { downloadsRemaining: -1 } },
+    { new: true, runValidators: false },
+  );
+
+  if (limitedResult) return limitedResult;
+
+  // Second attempt: unlimited file (no decrement needed)
+  const unlimitedResult = await File.findOneAndUpdate(
+    {
+      _id: fileId,
+      status: "active",
+      maxDownloads: null, // explicitly unlimited
+    },
+    { $set: { updatedAt: new Date() } }, // touch updatedAt for audit trail
+    { new: true, runValidators: false },
+  );
+
+  return unlimitedResult; // null if file not found or not active
+}
+
+/**
+ * logDownload
+ *
+ * Appends a download audit entry and increments downloadCount.
+ * Called after a successful decrement — never before.
+ *
+ * We use updateOne here rather than fetching the document and calling
+ * file.recordDownload() + file.save(). This is intentional:
+ *   - We already have the updated document from atomicDecrementDownload
+ *   - A second find-then-save would require fetching the full downloads array
+ *   - $push + $inc in a single updateOne is more efficient
+ *
+ * @param {Object} file    - Updated file document from atomicDecrementDownload
+ * @param {string} ipAddress
+ * @param {string} userAgent
+ */
+async function logDownload(file, ipAddress, userAgent) {
+  const ipHash = hashIp(ipAddress);
+
+  await File.updateOne(
+    { _id: file._id },
+    {
+      $push: {
+        downloads: {
+          downloadedAt: new Date(),
+          ipHash,
+          userAgent: (userAgent || "").substring(0, 200),
+        },
+      },
+      $inc: { downloadCount: 1 },
+    },
+  );
+}
+
+/**
+ * generateDeliveryUrl
+ *
+ * Routes to the correct storage provider based on the file's storageProvider
+ * field. This is how the Cloudinary → S3 migration works transparently —
+ * old files serve from Cloudinary, new files from S3, same code path.
+ *
+ * @param {Object} file - Updated file document
+ * @returns {Promise<string>} Signed URL
+ */
+async function generateDeliveryUrl(file) {
+  // During migration: each file knows which provider stored it.
+  // We import both providers and select based on the document's field.
+  // In steady state (all files on one provider), this always picks the same one.
+  let provider;
+
+  if (file.storageProvider === "cloudinary") {
+    const CloudinaryProvider = require("../storage/CloudinaryProvider");
+    provider = new CloudinaryProvider();
+  } else if (file.storageProvider === "s3") {
+    const S3Provider = require("../storage/S3Provider");
+    provider = new S3Provider();
+  } else {
+    throw AppError.serviceUnavailable(
+      `Unknown storage provider: ${file.storageProvider}`,
+    );
+  }
+
+  return provider.generateSignedDeliveryUrl(file.storageKey, {
+    ttlSeconds: env.signedUrlTtlSeconds,
+    originalName: file.originalName,
+    mimeType: file.mimeType,
+  });
+}
+
+// ─── Exports ───────────────────────────────────────────────────────────────
+// Add getFileMeta and downloadFile to the existing module.exports
+
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 /**
@@ -217,4 +538,6 @@ function buildShareUrl(fileId) {
 module.exports = {
   generateUploadCredentials,
   registerFile,
+  getFileMeta,
+  downloadFile,
 };
