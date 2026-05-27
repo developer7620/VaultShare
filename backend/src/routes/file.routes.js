@@ -1,7 +1,3 @@
-/**
- * Updated file.routes.js — complete file with all 4 routes
- */
-
 "use strict";
 
 const router = require("express").Router();
@@ -18,7 +14,6 @@ const {
   downloadFileSchema,
 } = require("../validation/file.schemas");
 
-// Stricter rate limit for register (Day 4 — kept here for completeness)
 const registerLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -34,15 +29,13 @@ const registerLimiter = rateLimit({
   },
 });
 
-// ─── Upload flow (Day 4) ───────────────────────────────────────────────────
-
+// ─── Upload flow ───────────────────────────────────────────────────────────
 router.post(
   "/sign",
   generalLimiter,
   validate(signUploadSchema),
   fileController.sign,
 );
-
 router.post(
   "/register",
   registerLimiter,
@@ -50,28 +43,33 @@ router.post(
   fileController.register,
 );
 
-// ─── Download flow (Day 5) ─────────────────────────────────────────────────
-
-/**
- * GET /api/files/:id
- * Fetch public metadata — no counter decrement, no signed URL
- * Rate limit: generous (100/15min) — read-only, cheap query
- */
+// ─── Download flow ─────────────────────────────────────────────────────────
 router.get("/:id", generalLimiter, fileController.getMeta);
-
-/**
- * POST /api/files/:id/download
- * Verify access and return signed URL — decrements download counter
- * Rate limit: strict (10/15min) — prevents password brute-forcing
- *
- * Uses downloadLimiter from Day 2's rateLimiter.js.
- * Day 9 adds per-file IP tracking on top of this global limit.
- */
 router.post(
   "/:id/download",
   downloadLimiter,
   validate(downloadFileSchema),
   fileController.download,
 );
+
+// ─── Lifecycle management ──────────────────────────────────────────────────
+
+/**
+ * GET /api/files/:id/status
+ * Full lifecycle state — for uploader dashboards.
+ * Must be registered BEFORE /:id to avoid Express matching /status as an ID.
+ *
+ * Route ordering is critical in Express: /:id/status must come before
+ * any catch-all /:id route or Express will treat 'status' as a fileId.
+ * Here it's fine because /:id only handles GET and our status route
+ * specifies the full path /:id/status.
+ */
+router.get("/:id/status", generalLimiter, fileController.getStatus);
+
+/**
+ * DELETE /api/files/:id
+ * Soft delete — marks as deleted and removes from Cloudinary.
+ */
+router.delete("/:id", generalLimiter, fileController.deleteFile);
 
 module.exports = router;

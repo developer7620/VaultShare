@@ -311,6 +311,116 @@ async function downloadFile({ fileId, password, ipAddress, userAgent }) {
   };
 }
 
+// ─── Lifecycle management ──────────────────────────────────────────────────
+
+/**
+ * deleteFile (soft delete)
+ *
+ * Marks a file as deleted and triggers storage cleanup.
+ * Does NOT require authentication in this version — any client with
+ * the fileId can delete. Day 9 adds an upload token for ownership verification.
+ *
+ * Sequence (same ordering principle as expiry job):
+ *   1. Mark as 'deleted' in MongoDB first
+ *   2. Delete from Cloudinary
+ *   3. Clear storageKey
+ *
+ * @param {string} fileId
+ * @returns {Promise<void>}
+ */
+async function softDeleteFile(fileId) {
+  // Find the file regardless of status — allow deleting already-expired files
+  const file = await File.findById(fileId);
+
+  if (!file) {
+    throw AppError.notFound("File not found.");
+  }
+
+  if (file.status === "deleted") {
+    // Idempotent — deleting an already-deleted file is a no-op
+    return;
+  }
+
+  // Step 1: Mark deleted in MongoDB (source of truth)
+  await File.updateOne({ _id: fileId }, { $set: { status: "deleted" } });
+
+  // Step 2: Delete from storage (best-effort — failure doesn't block response)
+  // If this fails, the expiry cron job will clean it up on the next retry pass
+  // because expired/deleted files with storageKey set are retried.
+  if (file.storageKey) {
+    try {
+      const CloudinaryProvider = require("../storage/CloudinaryProvider");
+      const S3Provider = require("../storage/S3Provider");
+
+      let provider;
+      if (file.storageProvider === "cloudinary") {
+        provider = new CloudinaryProvider();
+      } else {
+        provider = new S3Provider();
+      }
+
+      await provider.deleteFile(file.storageKey);
+
+      // Step 3: Clear storageKey — confirms storage deletion
+      await File.updateOne({ _id: fileId }, { $set: { storageKey: null } });
+    } catch (err) {
+      // Log but don't fail — MongoDB is already updated, cron will retry storage
+      console.error(
+        `[FileService] Storage deletion failed for ${fileId}:`,
+        err.message,
+      );
+    }
+  }
+}
+
+/**
+ * getFileStatus
+ *
+ * Returns the full lifecycle status of a file.
+ * Used by uploaders to monitor their file's state.
+ *
+ * Unlike getFileMeta (which returns 404 for expired files),
+ * this returns the actual status — useful for the uploader's dashboard.
+ *
+ * @param {string} fileId
+ * @returns {Promise<Object>}
+ */
+async function getFileStatus(fileId) {
+  const file = await File.findById(fileId);
+
+  if (!file) {
+    throw AppError.notFound("File not found.");
+  }
+
+  return {
+    fileId: file._id,
+    originalName: file.originalName,
+    status: file.status,
+    isPasswordProtected: file.isPasswordProtected,
+    maxDownloads: file.maxDownloads,
+    downloadsRemaining: file.downloadsRemaining,
+    downloadCount: file.downloadCount,
+    humanReadableSize: file.humanReadableSize,
+    mimeType: file.mimeType,
+    sizeBytes: file.sizeBytes,
+    expiresAt: file.expiresAt,
+    isExpired: file.isExpired, // real-time virtual
+    isDownloadLimitReached: file.isDownloadLimitReached,
+    createdAt: file.createdAt,
+    updatedAt: file.updatedAt,
+  };
+}
+
+// Add to module.exports:
+module.exports = {
+  generateUploadCredentials,
+  registerFile,
+  getFileMeta,
+  downloadFile,
+  softDeleteFile, // ← new
+  getFileStatus, // ← new
+};
+
 // ─── Private helpers ───────────────────────────────────────────────────────
 
 /**
@@ -540,4 +650,6 @@ module.exports = {
   registerFile,
   getFileMeta,
   downloadFile,
+  softDeleteFile,
+  getFileStatus,
 };
