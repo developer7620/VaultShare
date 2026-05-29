@@ -114,7 +114,8 @@ async function registerFile({
   // ── Step 4: Generate upload token ────────────────────────────────────
   // Generated for every file — required for deletion.
   // plaintext is returned to client once. hash is stored in DB.
-  const { plaintext: uploadToken, hash: uploadTokenHash } = await generateUploadToken();
+  const { plaintext: uploadToken, hash: uploadTokenHash } =
+    await generateUploadToken();
 
   // ── Step 5: Create File document ─────────────────────────────────────
   const file = await File.create({
@@ -517,7 +518,7 @@ async function atomicDecrementDownload(fileId) {
       downloadsRemaining: { $gt: 0 }, // has remaining
     },
     { $inc: { downloadsRemaining: -1 } },
-    { new: true, runValidators: false },
+    { returnDocument: "after", runValidators: false },
   );
 
   if (limitedResult) return limitedResult;
@@ -530,7 +531,7 @@ async function atomicDecrementDownload(fileId) {
       maxDownloads: null, // explicitly unlimited
     },
     { $set: { updatedAt: new Date() } }, // touch updatedAt for audit trail
-    { new: true, runValidators: false },
+    { returnDocument: "after", runValidators: false },
   );
 
   return unlimitedResult; // null if file not found or not active
@@ -623,36 +624,28 @@ async function generateDeliveryUrl(file) {
  * @throws {AppError} If the resource doesn't exist or has wrong type
  */
 async function verifyStorageKeyExists(storageKey) {
-  const cloudinary = require("cloudinary").v2;
+  // Skip verification in development — the Cloudinary Admin API
+  // may be blocked by network/firewall. In production, enable this.
+  if (env.nodeEnv === "development") {
+    console.log(
+      `[FileService] Skipping Cloudinary verification in dev for: ${storageKey}`,
+    );
+    return;
+  }
+
+  const CloudinaryProvider = require("../storage/CloudinaryProvider");
+  const provider = new CloudinaryProvider();
 
   try {
-    // cloudinary.api.resource() throws if the resource doesn't exist
-    const resource = await cloudinary.api.resource(storageKey, {
-      resource_type: "raw",
-      type: "private",
-    });
-
-    // Sanity check: confirm it's in our folder
-    // (Cloudinary returns the resource even if the folder doesn't match
-    //  when called with the exact public_id — belt and suspenders)
-    if (!resource.public_id.startsWith(env.cloudinary.uploadFolder + "/")) {
-      throw new Error("Resource not in expected folder");
-    }
-  } catch (err) {
-    // Cloudinary throws with err.error.http_code === 404 for missing resources
-    if (err.error?.http_code === 404 || err.message?.includes("not found")) {
+    const resource = await provider.verifyResource(storageKey);
+    if (!resource) {
       throw AppError.badRequest(
         "The uploaded file could not be verified. Please try uploading again.",
         "STORAGE_KEY_NOT_FOUND",
       );
     }
-
-    if (err.isOperational) {
-      // Re-throw our own AppErrors (e.g., folder mismatch above)
-      throw err;
-    }
-
-    // Cloudinary API error (network, auth, etc.)
+  } catch (err) {
+    if (err.isOperational) throw err;
     throw AppError.serviceUnavailable(
       "File verification failed. Storage service may be temporarily unavailable.",
     );
