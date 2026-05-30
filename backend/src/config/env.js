@@ -15,6 +15,7 @@ const REQUIRED_VARS = [
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
   "PORT",
+  "ADMIN_API_KEY",
 ];
 
 function validateEnv() {
@@ -58,6 +59,12 @@ const env = {
     cloudfrontDomain: process.env.AWS_CLOUDFRONT_DOMAIN || null,
     // Upload URL TTL (presigned PUT) — 1 hour max
     uploadUrlTtlSeconds: parseInt(process.env.AWS_UPLOAD_URL_TTL || "3600", 10),
+  },
+
+  admin: {
+    apiKey: process.env.ADMIN_API_KEY,
+    // Max files returned per page
+    pageSize: parseInt(process.env.ADMIN_PAGE_SIZE || "50", 10),
   },
 
   // How long a signed delivery URL stays valid (seconds)
