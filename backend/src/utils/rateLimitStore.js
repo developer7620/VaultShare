@@ -30,8 +30,8 @@ class MemoryStore {
     this._store = new Map();
 
     // Cleanup every 10 minutes
-    const interval = setInterval(() => this._cleanup(), 10 * 60 * 1000);
-    interval.unref();
+    this._cleanupInterval = setInterval(() => this._cleanup(), 10 * 60 * 1000);
+    this._cleanupInterval.unref();
   }
 
   async increment(key, ttlMs) {
@@ -86,6 +86,12 @@ class MemoryStore {
     }
     if (removed > 0) {
       console.log(`[RateLimitStore] Cleaned ${removed} expired entries`);
+    }
+  }
+
+  close() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
     }
   }
 }
@@ -149,15 +155,19 @@ class RedisStore {
 // ─── Factory ───────────────────────────────────────────────────────────────
 
 function createStore() {
+  const isTest = process.env.NODE_ENV === "test";
+
   if (env.redis?.url) {
-    // RedisStore instantiation would go here when uncommented
-    console.log("[RateLimitStore] Using Redis store");
+    if (!isTest) console.log("[RateLimitStore] Using Redis store");
     // return new RedisStore(env.redis.url);
   }
 
-  console.log(
-    "[RateLimitStore] Using in-memory store (not suitable for multi-process)",
-  );
+  if (!isTest) {
+    console.log(
+      "[RateLimitStore] Using in-memory store (not suitable for multi-process)",
+    );
+  }
+
   return new MemoryStore();
 }
 

@@ -8,8 +8,19 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+      "test": "jest --runInBand --forceExit",
+    "test:watch": "jest --watch --runInBand",
+    "test:coverage": "jest --coverage --runInBand --forceExit"
   },
+
+  "jest": {
+  "testEnvironment": "node",
+  "testMatch": ["**/tests/**/*.test.js"],
+  "testTimeout": 30000,
+  "setupFiles": ["./tests/setup.js"],
+  "globalTeardown": "./tests/teardown.js"
+},
+    
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -29,6 +40,9 @@
     "uuid": "^14.0.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "jest": "^30.4.2",
+    "mongodb-memory-server": "^11.2.0",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.2.2"
   }
 }
