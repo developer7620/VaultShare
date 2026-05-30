@@ -156,3 +156,48 @@ export async function deleteFile(fileId, uploadToken) {
     headers: { Authorization: `Bearer ${uploadToken}` },
   });
 }
+
+/**
+ * Upload file directly to S3 using a presigned PUT URL.
+ *
+ * S3 upload differs from Cloudinary:
+ *   - Method: PUT (not POST)
+ *   - Body: raw file bytes (not FormData)
+ *   - Required header: Content-Type matching the signed mimeType
+ *
+ * Progress tracking: fetch() doesn't expose upload progress.
+ * For S3, use XHR as well.
+ *
+ * @param {File}     file        - Browser File object
+ * @param {Object}   credentials - From getUploadSignature() for S3 provider
+ * @param {Function} onProgress  - (percent: number) => void
+ */
+export function uploadToS3(file, credentials, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress?.(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        // S3 PUT returns 200 with empty body on success
+        resolve({ storageKey: credentials.storageKey });
+      } else {
+        reject(new Error(`S3 upload failed: ${xhr.status} ${xhr.statusText}`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Network error during S3 upload"));
+    xhr.onabort = () => reject(new Error("Upload cancelled"));
+
+    xhr.open("PUT", credentials.uploadUrl);
+    // Content-Type MUST match what was signed — S3 enforces this
+    xhr.setRequestHeader("Content-Type", credentials.contentType || file.type);
+    // Send raw bytes — NOT FormData
+    xhr.send(file);
+  });
+}

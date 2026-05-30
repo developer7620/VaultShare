@@ -4,17 +4,17 @@
  * States:
  *   idle → signing → uploading (with progress) → registering → done → error
  *
- * Why a custom hook instead of inline state in the component?
- * The upload flow has 5 distinct async steps. Putting all state
- * management in the component creates a 200-line component that's
- * impossible to test or reason about. The hook isolates the state
- * machine; the component just renders it.
+ * Provider-agnostic: routes to S3 or Cloudinary based on the
+ * credentials.method field returned by /api/files/sign.
+ *   - method: 'PUT'  → S3 (raw bytes via XHR PUT)
+ *   - method: absent → Cloudinary (multipart form POST)
  */
 
 import { useState, useCallback } from "react";
 import {
   getUploadSignature,
   uploadToCloudinary,
+  uploadToS3,
   registerFile,
 } from "../api/vaultshare";
 
@@ -30,7 +30,7 @@ const STAGES = {
 export function useUpload() {
   const [stage, setStage] = useState(STAGES.IDLE);
   const [progress, setProgress] = useState(0);
-  const [result, setResult] = useState(null); // { fileId, uploadToken, shareUrl }
+  const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
 
   const upload = useCallback(async (file, options = {}) => {
@@ -41,27 +41,41 @@ export function useUpload() {
     setProgress(0);
 
     try {
-      // ── Phase 1: Get upload credentials ────────────────────────────────
+      // ── Phase 1: Get upload credentials from backend ──────────────────
       const { uploadCredentials } = await getUploadSignature({
         originalName: file.name,
         mimeType: file.type,
         sizeBytes: file.size,
       });
 
-      // ── Phase 2a: Upload to Cloudinary ─────────────────────────────────
+      // ── Phase 2a: Upload directly to storage provider ─────────────────
+      // credentials.method === 'PUT'  → S3 presigned PUT
+      // credentials.method absent     → Cloudinary signed POST
       setStage(STAGES.UPLOADING);
 
-      const cloudinaryResult = await uploadToCloudinary(
-        file,
-        uploadCredentials,
-        (percent) => setProgress(percent),
-      );
+      let storageKey;
 
-      // ── Phase 2b: Register with backend ────────────────────────────────
+      if (uploadCredentials.method === "PUT") {
+        // S3 path — PUT raw bytes, no FormData
+        const s3Result = await uploadToS3(file, uploadCredentials, (percent) =>
+          setProgress(percent),
+        );
+        storageKey = s3Result.storageKey;
+      } else {
+        // Cloudinary path — multipart POST with form fields
+        const cloudinaryResult = await uploadToCloudinary(
+          file,
+          uploadCredentials,
+          (percent) => setProgress(percent),
+        );
+        storageKey = cloudinaryResult.public_id;
+      }
+
+      // ── Phase 2b: Register file with backend ──────────────────────────
       setStage(STAGES.REGISTERING);
 
       const registration = await registerFile({
-        storageKey: cloudinaryResult.public_id,
+        storageKey,
         originalName: file.name,
         mimeType: file.type,
         sizeBytes: file.size,
