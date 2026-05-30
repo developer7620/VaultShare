@@ -49,6 +49,17 @@ const env = {
     signatureExpirySeconds: 3600,
   },
 
+  aws: {
+    region: process.env.AWS_REGION || "us-east-1",
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || null,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || null,
+    bucket: process.env.AWS_S3_BUCKET || null,
+    // Optional: CloudFront distribution domain for CDN delivery
+    cloudfrontDomain: process.env.AWS_CLOUDFRONT_DOMAIN || null,
+    // Upload URL TTL (presigned PUT) — 1 hour max
+    uploadUrlTtlSeconds: parseInt(process.env.AWS_UPLOAD_URL_TTL || "3600", 10),
+  },
+
   // How long a signed delivery URL stays valid (seconds)
   signedUrlTtlSeconds: parseInt(process.env.SIGNED_URL_TTL_SECONDS || "60", 10),
 
