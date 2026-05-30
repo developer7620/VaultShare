@@ -72,20 +72,34 @@ class CloudinaryProvider extends StorageProvider {
 
   async deleteFile(storageKey) {
     const client = this._getClient();
-    try {
-      const result = await client.uploader.destroy(storageKey, {
-        resource_type: "raw",
-        type: "upload", // ← match upload type
-        invalidate: true,
-      });
-      if (result.result !== "ok" && result.result !== "not found") {
-        throw new Error(`Unexpected result: ${result.result}`);
+
+    // Try 'upload' type first (current default), fall back to 'private'
+    // for files uploaded before the type change
+    for (const type of ["upload", "private"]) {
+      try {
+        const result = await client.uploader.destroy(storageKey, {
+          resource_type: "raw",
+          type,
+          invalidate: true,
+        });
+
+        if (result.result === "ok") {
+          return; // Successfully deleted
+        }
+
+        if (result.result === "not found") {
+          return; // Already gone — idempotent success
+        }
+      } catch (err) {
+        // Try next type
+        continue;
       }
-    } catch (err) {
-      throw new Error(
-        `[CloudinaryProvider] Failed to delete ${storageKey}: ${err.message}`,
-      );
     }
+
+    // Both types failed — log but don't throw (cron will retry)
+    console.warn(
+      `[CloudinaryProvider] Could not delete ${storageKey} with any type`,
+    );
   }
 
   async verifyResource(storageKey) {

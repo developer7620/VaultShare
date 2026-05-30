@@ -60,6 +60,25 @@ const env = {
     windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "900000", 10), // 15 min
     maxRequests: parseInt(process.env.RATE_LIMIT_MAX || "100", 10),
   },
+
+  redis: {
+    // Optional — if not set, falls back to in-memory store
+    url: process.env.REDIS_URL || null,
+    // Prefix all VaultShare keys to avoid collisions with other apps
+    keyPrefix: process.env.REDIS_KEY_PREFIX || "vaultshare:",
+  },
+
+  security: {
+    // Maximum total failed attempts per file before global lockout
+    maxGlobalAttemptsPerFile: parseInt(
+      process.env.MAX_GLOBAL_ATTEMPTS_PER_FILE || "20",
+      10,
+    ),
+    // Per-IP attempts before lockout (Day 7 — surfaced here for clarity)
+    maxAttemptsPerIp: parseInt(process.env.MAX_ATTEMPTS_PER_IP || "5", 10),
+    // Lockout duration in ms
+    lockoutMs: parseInt(process.env.LOCKOUT_MS || String(15 * 60 * 1000), 10),
+  },
 };
 
 module.exports = env;

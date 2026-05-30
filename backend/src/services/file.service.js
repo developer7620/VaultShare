@@ -250,17 +250,28 @@ async function getFileMeta(fileId) {
  * @param {string}      params.userAgent    - User-Agent header
  * @returns {Promise<Object>} { signedUrl, originalName, mimeType, downloadsRemaining }
  */
-async function downloadFile({ fileId, password, ipAddress, userAgent }) {
-  const ipHash = hashIp(ipAddress);
+async function downloadFile({
+  fileId,
+  password,
+  ipAddress,
+  userAgent,
+  acceptLanguage,
+}) {
+  // ── Step 1: Check lockout (cheapest — no DB) ──────────────────────────
+  const lockStatus = await attemptTracker.isLocked(
+    fileId,
+    ipAddress,
+    userAgent,
+    acceptLanguage,
+  );
 
-  // ── Step 1: Check brute-force lockout BEFORE any DB query ────────────
-  // Cheapest check first — no DB round trip needed to enforce a lockout.
-  const lockStatus = attemptTracker.isLocked(fileId, ipHash);
   if (lockStatus.locked) {
     const remainingMinutes = Math.ceil(lockStatus.remainingMs / 60000);
-    throw AppError.tooManyRequests(
-      `Too many failed attempts. Try again in ${remainingMinutes} minute(s).`,
-    );
+    const message =
+      lockStatus.reason === "GLOBAL_LOCKOUT"
+        ? `This file has been locked due to too many failed attempts. Try again in ${remainingMinutes} minute(s).`
+        : `Too many failed attempts from your location. Try again in ${remainingMinutes} minute(s).`;
+    throw AppError.tooManyRequests(message);
   }
 
   // ── Step 2: Fetch file ────────────────────────────────────────────────
@@ -285,28 +296,46 @@ async function downloadFile({ fileId, password, ipAddress, userAgent }) {
   try {
     await verifyPassword(file, password);
   } catch (err) {
-    // Password was wrong — record the failure
     if (file.isPasswordProtected) {
-      const result = attemptTracker.recordFailure(fileId, ipHash);
+      const result = await attemptTracker.recordFailure(
+        fileId,
+        ipAddress,
+        userAgent,
+        acceptLanguage,
+      );
 
-      if (result.locked) {
-        // Just got locked out on this attempt
+      if (result.globalLocked) {
         throw AppError.tooManyRequests(
-          `Too many failed attempts. Account locked for 15 minutes.`,
+          "Too many failed attempts on this file. Access locked for 15 minutes.",
         );
       }
 
-      // Tell the user how many attempts remain before lockout
+      if (result.locked) {
+        throw AppError.tooManyRequests(
+          "Too many failed attempts. Access locked for 15 minutes.",
+        );
+      }
+
+      const remaining = Math.min(
+        result.attemptsRemainingIp,
+        result.attemptsRemainingGlobal,
+      );
+
       throw AppError.unauthorized(
-        `Incorrect password. ${result.attemptsRemaining} attempt(s) remaining.`,
+        `Incorrect password. ${remaining} attempt(s) remaining.`,
       );
     }
     throw err;
   }
 
-  // ── Step 5: Reset attempt counter on success ──────────────────────────
+  // ── Step 5: Reset per-client counter on success ───────────────────────
   if (file.isPasswordProtected) {
-    attemptTracker.resetAttempts(fileId, ipHash);
+    await attemptTracker.resetClientAttempts(
+      fileId,
+      ipAddress,
+      userAgent,
+      acceptLanguage,
+    );
   }
 
   // ── Step 6: Atomic decrement ──────────────────────────────────────────
@@ -509,32 +538,38 @@ async function verifyPassword(file, providedPassword) {
  * @returns {Promise<import('../models/File.model')|null>}
  */
 async function atomicDecrementDownload(fileId) {
-  // First attempt: limited file with remaining downloads
+  // Limited file path
   const limitedResult = await File.findOneAndUpdate(
     {
       _id: fileId,
       status: "active",
-      maxDownloads: { $ne: null }, // has a limit
-      downloadsRemaining: { $gt: 0 }, // has remaining
+      maxDownloads: { $ne: null },
+      downloadsRemaining: { $gt: 0 },
     },
     { $inc: { downloadsRemaining: -1 } },
-    { returnDocument: "after", runValidators: false },
+    {
+      returnDocument: "after", // ← replaces deprecated { new: true }
+      runValidators: false,
+    },
   );
 
   if (limitedResult) return limitedResult;
 
-  // Second attempt: unlimited file (no decrement needed)
+  // Unlimited file path
   const unlimitedResult = await File.findOneAndUpdate(
     {
       _id: fileId,
       status: "active",
-      maxDownloads: null, // explicitly unlimited
+      maxDownloads: null,
     },
-    { $set: { updatedAt: new Date() } }, // touch updatedAt for audit trail
-    { returnDocument: "after", runValidators: false },
+    { $set: { updatedAt: new Date() } },
+    {
+      returnDocument: "after", // ← replaces deprecated { new: true }
+      runValidators: false,
+    },
   );
 
-  return unlimitedResult; // null if file not found or not active
+  return unlimitedResult;
 }
 
 /**

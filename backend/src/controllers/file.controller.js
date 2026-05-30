@@ -44,12 +44,16 @@ const download = asyncHandler(async (req, res) => {
   const { password } = req.body;
   const ipAddress = req.ip || req.socket?.remoteAddress || "unknown";
   const userAgent = req.headers["user-agent"] || "";
+  const acceptLanguage = req.headers["accept-language"] || "";
+
   const result = await fileService.downloadFile({
     fileId: req.params.id,
     password: password || null,
     ipAddress,
     userAgent,
+    acceptLanguage, // ← new
   });
+
   res.status(200).json({ success: true, data: result });
 });
 

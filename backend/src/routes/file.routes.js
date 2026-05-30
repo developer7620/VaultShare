@@ -9,6 +9,7 @@ const {
   downloadLimiter,
 } = require("../middleware/rateLimiter");
 const extractToken = require("../middleware/extractToken");
+const securityHeaders = require("../middleware/securityHeaders");
 const {
   signUploadSchema,
   registerFileSchema,
@@ -33,30 +34,45 @@ const registerLimiter = rateLimit({
 // ─── Upload flow ───────────────────────────────────────────────────────────
 router.post(
   "/sign",
+  securityHeaders.upload,
   generalLimiter,
   validate(signUploadSchema),
   fileController.sign,
 );
+
 router.post(
   "/register",
+  securityHeaders.upload,
   registerLimiter,
   validate(registerFileSchema),
   fileController.register,
 );
 
 // ─── Download flow ─────────────────────────────────────────────────────────
-router.get("/:id", generalLimiter, fileController.getMeta);
+router.get("/:id", securityHeaders.api, generalLimiter, fileController.getMeta);
+
 router.post(
   "/:id/download",
+  securityHeaders.download,
   downloadLimiter,
   validate(downloadFileSchema),
   fileController.download,
 );
 
 // ─── Lifecycle management ──────────────────────────────────────────────────
-router.get("/:id/status", generalLimiter, fileController.getStatus);
+router.get(
+  "/:id/status",
+  securityHeaders.api,
+  generalLimiter,
+  fileController.getStatus,
+);
 
-// extractToken parses Authorization: Bearer <token> before deleteFile runs
-router.delete("/:id", generalLimiter, extractToken, fileController.deleteFile);
+router.delete(
+  "/:id",
+  securityHeaders.api,
+  generalLimiter,
+  extractToken,
+  fileController.deleteFile,
+);
 
 module.exports = router;

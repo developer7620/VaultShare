@@ -1,157 +1,199 @@
 /**
- * In-memory attempt tracker for per-file brute-force protection.
+ * Attempt tracker — two-layer brute-force protection.
  *
- * Tracks failed download attempts per (fileId, ipHash) pair.
- * After MAX_ATTEMPTS failures, the pair is locked for LOCKOUT_MS.
+ * Layer 1: Per (fileId, fingerprint) — locks out a specific client
+ *   after MAX_ATTEMPTS_PER_IP failures. Day 7 logic, now using
+ *   the shared store for Redis compatibility.
  *
- * Data structure:
- *   Map<string, { count: number, lockedUntil: number | null, lastAttempt: number }>
- *   Key: `${fileId}:${ipHash}`
+ * Layer 2: Per (fileId) global — locks out ALL access to a file
+ *   after MAX_GLOBAL_ATTEMPTS total failures. Defeats IP rotation.
  *
- * Production note:
- *   Replace the Map with Redis (ioredis) for multi-process deployments.
- *   The interface (isLocked, recordFailure, reset) stays identical —
- *   only the backing store changes. This is the same abstraction pattern
- *   as the StorageProvider.
+ * Fingerprint = hash(ip + userAgent + acceptLanguage)
+ * More stable than IP alone, harder to rotate than IP alone.
  *
- * Memory management:
- *   The Map is cleaned up every CLEANUP_INTERVAL_MS to prevent unbounded
- *   growth. Only entries older than LOCKOUT_MS are removed.
+ * Key schema:
+ *   attempt:ip:{fileId}:{fingerprint}  → per-client counter
+ *   attempt:global:{fileId}            → global counter
+ *   lock:ip:{fileId}:{fingerprint}     → lockout marker
+ *   lock:global:{fileId}               → global lockout marker
  */
 
 "use strict";
 
-const MAX_ATTEMPTS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
-const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const crypto = require("crypto");
+const store = require("./rateLimitStore");
+const env = require("../config/env");
 
-// The in-memory store
-const attempts = new Map();
+const MAX_PER_IP = env.security?.maxAttemptsPerIp || 5;
+const MAX_GLOBAL = env.security?.maxGlobalAttemptsPerFile || 20;
+const LOCKOUT_MS = env.security?.lockoutMs || 15 * 60 * 1000;
+
+// ─── Fingerprinting ────────────────────────────────────────────────────────
 
 /**
- * Build the key for a (fileId, ipHash) pair.
- * @param {string} fileId
- * @param {string} ipHash
- * @returns {string}
+ * Build a request fingerprint from multiple signals.
+ * More stable than IP alone for rate limiting purposes.
+ *
+ * @param {string} ip
+ * @param {string} userAgent
+ * @param {string} acceptLanguage
+ * @returns {string} 16-char hex fingerprint
  */
-function makeKey(fileId, ipHash) {
-  return `${fileId}:${ipHash}`;
+function buildFingerprint(ip, userAgent = "", acceptLanguage = "") {
+  const raw = [
+    ip || "unknown",
+    userAgent.substring(0, 100),
+    acceptLanguage.substring(0, 50),
+  ].join("|");
+
+  // 8 bytes = 16 hex chars — short enough for Map keys, unique enough
+  return crypto.createHash("sha256").update(raw).digest("hex").substring(0, 16);
 }
 
+// ─── Key builders ──────────────────────────────────────────────────────────
+
+const keys = {
+  ipAttempt: (fileId, fp) => `attempt:ip:${fileId}:${fp}`,
+  ipLock: (fileId, fp) => `lock:ip:${fileId}:${fp}`,
+  globalAttempt: (fileId) => `attempt:global:${fileId}`,
+  globalLock: (fileId) => `lock:global:${fileId}`,
+};
+
+// ─── Public API ────────────────────────────────────────────────────────────
+
 /**
- * Check if a (fileId, IP) pair is currently locked out.
+ * Check if a request is locked out before touching the DB.
+ * Checks both layers — per-client and global.
  *
  * @param {string} fileId
- * @param {string} ipHash
- * @returns {{ locked: boolean, remainingMs: number }}
+ * @param {string} ip
+ * @param {string} userAgent
+ * @param {string} acceptLanguage
+ * @returns {Promise<{ locked: boolean, reason: string|null, remainingMs: number }>}
  */
-function isLocked(fileId, ipHash) {
-  const key = makeKey(fileId, ipHash);
-  const entry = attempts.get(key);
+async function isLocked(fileId, ip, userAgent, acceptLanguage) {
+  const fp = buildFingerprint(ip, userAgent, acceptLanguage);
 
-  if (!entry) return { locked: false, remainingMs: 0 };
-
-  if (entry.lockedUntil && Date.now() < entry.lockedUntil) {
+  // Check global lockout first (affects all clients — cheapest to check)
+  const globalLock = await store.get(keys.globalLock(fileId));
+  if (globalLock) {
     return {
       locked: true,
-      remainingMs: entry.lockedUntil - Date.now(),
+      reason: "GLOBAL_LOCKOUT",
+      remainingMs: globalLock.ttlMs,
     };
   }
 
-  // Lock has expired — clean up
-  if (entry.lockedUntil && Date.now() >= entry.lockedUntil) {
-    attempts.delete(key);
-    return { locked: false, remainingMs: 0 };
+  // Check per-client lockout
+  const ipLock = await store.get(keys.ipLock(fileId, fp));
+  if (ipLock) {
+    return {
+      locked: true,
+      reason: "IP_LOCKOUT",
+      remainingMs: ipLock.ttlMs,
+    };
   }
 
-  return { locked: false, remainingMs: 0 };
+  return { locked: false, reason: null, remainingMs: 0 };
 }
 
 /**
- * Record a failed attempt for a (fileId, IP) pair.
- * If MAX_ATTEMPTS is reached, sets the lockout timer.
+ * Record a failed attempt. Updates both per-client and global counters.
+ * Sets lockout markers if thresholds are crossed.
  *
  * @param {string} fileId
- * @param {string} ipHash
- * @returns {{ locked: boolean, attemptsRemaining: number }}
+ * @param {string} ip
+ * @param {string} userAgent
+ * @param {string} acceptLanguage
+ * @returns {Promise<{
+ *   locked: boolean,
+ *   globalLocked: boolean,
+ *   attemptsRemainingIp: number,
+ *   attemptsRemainingGlobal: number
+ * }>}
  */
-function recordFailure(fileId, ipHash) {
-  const key = makeKey(fileId, ipHash);
-  const entry = attempts.get(key) || {
-    count: 0,
-    lockedUntil: null,
-    lastAttempt: Date.now(),
-  };
+async function recordFailure(fileId, ip, userAgent, acceptLanguage) {
+  const fp = buildFingerprint(ip, userAgent, acceptLanguage);
 
-  entry.count += 1;
-  entry.lastAttempt = Date.now();
+  // Increment both counters concurrently
+  const [ipResult, globalResult] = await Promise.all([
+    store.increment(keys.ipAttempt(fileId, fp), LOCKOUT_MS),
+    store.increment(keys.globalAttempt(fileId), LOCKOUT_MS),
+  ]);
 
-  if (entry.count >= MAX_ATTEMPTS) {
-    entry.lockedUntil = Date.now() + LOCKOUT_MS;
-    attempts.set(key, entry);
-    return { locked: true, attemptsRemaining: 0 };
+  let ipLocked = false;
+  let globalLocked = false;
+
+  // Check per-client threshold
+  if (ipResult.count >= MAX_PER_IP) {
+    await store.increment(keys.ipLock(fileId, fp), LOCKOUT_MS);
+    ipLocked = true;
   }
 
-  attempts.set(key, entry);
+  // Check global threshold
+  if (globalResult.count >= MAX_GLOBAL) {
+    await store.increment(keys.globalLock(fileId), LOCKOUT_MS);
+    globalLocked = true;
+  }
+
   return {
-    locked: false,
-    attemptsRemaining: MAX_ATTEMPTS - entry.count,
+    locked: ipLocked || globalLocked,
+    globalLocked,
+    attemptsRemainingIp: Math.max(0, MAX_PER_IP - ipResult.count),
+    attemptsRemainingGlobal: Math.max(0, MAX_GLOBAL - globalResult.count),
   };
 }
 
 /**
- * Reset the attempt counter for a (fileId, IP) pair.
- * Called after a successful download (correct password).
+ * Reset all attempt counters for a (fileId, client) pair.
+ * Called after a successful download — clears per-client counter only.
+ * Global counter is NOT reset (prevents gaming via 1 correct password).
  *
  * @param {string} fileId
- * @param {string} ipHash
+ * @param {string} ip
+ * @param {string} userAgent
+ * @param {string} acceptLanguage
  */
-function resetAttempts(fileId, ipHash) {
-  attempts.delete(makeKey(fileId, ipHash));
+async function resetClientAttempts(fileId, ip, userAgent, acceptLanguage) {
+  const fp = buildFingerprint(ip, userAgent, acceptLanguage);
+
+  await Promise.all([
+    store.delete(keys.ipAttempt(fileId, fp)),
+    store.delete(keys.ipLock(fileId, fp)),
+  ]);
 }
 
 /**
- * Get current attempt info without modifying state.
- * Used for logging and debug endpoints.
- *
- * @param {string} fileId
- * @param {string} ipHash
- * @returns {{ count: number, lockedUntil: number | null } | null}
+ * Get current attempt info for debugging/admin endpoints.
  */
-function getAttemptInfo(fileId, ipHash) {
-  return attempts.get(makeKey(fileId, ipHash)) || null;
+async function getAttemptInfo(fileId, ip, userAgent, acceptLanguage) {
+  const fp = buildFingerprint(ip, userAgent, acceptLanguage);
+
+  const [ipAttempt, globalAttempt, ipLock, globalLock] = await Promise.all([
+    store.get(keys.ipAttempt(fileId, fp)),
+    store.get(keys.globalAttempt(fileId)),
+    store.get(keys.ipLock(fileId, fp)),
+    store.get(keys.globalLock(fileId)),
+  ]);
+
+  return {
+    fingerprint: fp,
+    ipAttempts: ipAttempt?.count || 0,
+    globalAttempts: globalAttempt?.count || 0,
+    ipLocked: !!ipLock,
+    globalLocked: !!globalLock,
+    ipLockRemainingMs: ipLock?.ttlMs || 0,
+    globalLockRemainingMs: globalLock?.ttlMs || 0,
+  };
 }
-
-// ─── Memory cleanup ────────────────────────────────────────────────────────
-// Remove stale entries every hour to prevent unbounded Map growth.
-// Only entries where the lockout has expired AND no recent activity are removed.
-const cleanupInterval = setInterval(() => {
-  const now = Date.now();
-  let removed = 0;
-
-  for (const [key, entry] of attempts.entries()) {
-    const isExpiredLock = entry.lockedUntil && now >= entry.lockedUntil;
-    const isStale = now - entry.lastAttempt > LOCKOUT_MS;
-
-    if (isExpiredLock || isStale) {
-      attempts.delete(key);
-      removed++;
-    }
-  }
-
-  if (removed > 0) {
-    console.log(`[AttemptTracker] Cleaned up ${removed} stale entries`);
-  }
-}, CLEANUP_INTERVAL_MS);
-
-// Prevent the interval from keeping the process alive during shutdown
-cleanupInterval.unref();
 
 module.exports = {
   isLocked,
   recordFailure,
-  resetAttempts,
+  resetClientAttempts,
   getAttemptInfo,
-  MAX_ATTEMPTS,
+  buildFingerprint,
+  MAX_PER_IP,
+  MAX_GLOBAL,
   LOCKOUT_MS,
 };
