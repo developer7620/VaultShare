@@ -80,10 +80,17 @@ const getOrphans = asyncHandler(async (req, res) => {
   });
 });
 
+const getDeadLetterStats = asyncHandler(async (req, res) => {
+  const deadLetterService = require("../services/deadLetter.service");
+  const stats = await deadLetterService.getQueueStats();
+  res.status(200).json({ success: true, data: stats });
+});
+
 module.exports = {
   listFiles,
   getStats,
   getDownloadLog,
   deleteFile,
   getOrphans,
+  getDeadLetterStats,
 };

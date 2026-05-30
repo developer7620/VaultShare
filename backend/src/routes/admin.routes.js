@@ -18,6 +18,7 @@ const router = require("express").Router();
 const rateLimit = require("express-rate-limit");
 const adminController = require("../controllers/admin.controller");
 const adminAuth = require("../middleware/adminAuth");
+const deadLetterService = require("../services/deadLetter.service");
 
 // All admin routes require the API key — applied once at router level
 router.use(adminAuth);
@@ -50,5 +51,7 @@ router.get("/files/:id/downloads", adminController.getDownloadLog);
 
 // ── Force delete ───────────────────────────────────────────────────────────
 router.delete("/files/:id", adminController.deleteFile);
+
+router.get("/dead-letter", adminController.getDeadLetterStats);
 
 module.exports = router;

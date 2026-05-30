@@ -63,36 +63,36 @@ function getProvider(providerName) {
  *             deletion failed previously (status: expired, storageKey not null)
  */
 async function sweepExpiredFiles() {
-  const runId = Date.now(); // correlate log lines for this run
+  const runId = Date.now();
+  const deadLetterService = require("../services/deadLetter.service");
+
   console.log(`[ExpiryJob:${runId}] Starting sweep`);
 
   try {
-    // ── Pass 1: Mark newly expired files ──────────────────────────────────
     const nowExpired = await findAndMarkExpired(runId);
-
-    // ── Pass 2: Retry Cloudinary cleanup for previously failed deletions ──
     const retryTargets = await findExpiredWithStorageKey(runId);
-
-    // Combine both sets — all need Cloudinary deletion
     const toDelete = [...nowExpired, ...retryTargets];
 
-    if (toDelete.length === 0) {
+    if (toDelete.length > 0) {
+      console.log(
+        `[ExpiryJob:${runId}] Deleting ${toDelete.length} file(s) from storage`,
+      );
+      await deleteInBatches(toDelete, 5, runId);
+    } else {
       console.log(`[ExpiryJob:${runId}] No files to clean up`);
-      return;
     }
 
-    console.log(
-      `[ExpiryJob:${runId}] Deleting ${toDelete.length} file(s) from storage`,
-    );
-
-    // Delete from storage concurrently with a concurrency cap.
-    // Deleting all files simultaneously could overwhelm Cloudinary's API
-    // rate limits. Process in batches of 5.
-    await deleteInBatches(toDelete, 5, runId);
+    // Process dead-letter queue on every sweep
+    const dlResult = await deadLetterService.processQueue();
+    if (dlResult.processed > 0) {
+      console.log(
+        `[ExpiryJob:${runId}] Dead-letter: ` +
+          `${dlResult.resolved} resolved, ${dlResult.failed} still failing`,
+      );
+    }
 
     console.log(`[ExpiryJob:${runId}] Sweep complete`);
   } catch (err) {
-    // Log but don't rethrow — a cron job crashing should not crash the server
     console.error(`[ExpiryJob:${runId}] Sweep failed:`, err.message);
   }
 }
@@ -198,25 +198,40 @@ async function deleteInBatches(files, batchSize, runId) {
  * @param {string} runId
  */
 async function deleteFileFromStorage(file, runId) {
+  const deadLetterService = require("../services/deadLetter.service");
+
   try {
     const provider = getProvider(file.storageProvider);
     await provider.deleteFile(file.storageKey);
 
-    // Clear storageKey — signals that storage deletion succeeded.
-    // If we crash after deletion but before this update, the next run
-    // will try to delete again — Cloudinary's deleteFile is idempotent
-    // (returns 'not found' for already-deleted files, doesn't throw).
+    // Clear storageKey — signals that storage deletion succeeded
     await File.updateOne({ _id: file._id }, { $set: { storageKey: null } });
 
     console.log(
       `[ExpiryJob:${runId}] Deleted ${file.storageKey} from ${file.storageProvider}`,
     );
   } catch (err) {
-    // Log individual failures but don't stop the batch
     console.error(
       `[ExpiryJob:${runId}] Failed to delete ${file.storageKey}:`,
       err.message,
     );
+
+    // Enqueue for retry instead of silently dropping
+    await deadLetterService
+      .enqueue({
+        storageKey: file.storageKey,
+        storageProvider: file.storageProvider,
+        reason: "expiry_cleanup",
+        fileId: file._id,
+        error: err.message,
+      })
+      .catch((enqueueErr) => {
+        // If even the enqueue fails, log it — don't crash the cron job
+        console.error(
+          `[ExpiryJob:${runId}] Failed to enqueue dead-letter for ${file.storageKey}:`,
+          enqueueErr.message,
+        );
+      });
   }
 }
 

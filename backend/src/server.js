@@ -6,17 +6,17 @@ const env = require("./config/env");
 const { connectDB, disconnectDB } = require("./config/db");
 const app = require("./app");
 const { startExpiryJob } = require("./jobs/expiry.job");
+const { startOrphanJob } = require("./jobs/orphan.job");
 
 let server;
 let expiryJob; // keep reference for graceful shutdown
+let orphanJob;
 
 async function start() {
   await connectDB();
 
-  // Start the expiry cron job after DB is connected
-  // runImmediately: true — sweep on startup to catch files that expired
-  // during any server downtime window
   expiryJob = startExpiryJob({ runImmediately: true });
+  orphanJob = startOrphanJob({ runImmediately: false }); // don't run on every restart
 
   server = app.listen(env.port, () => {
     console.log(
@@ -34,14 +34,17 @@ async function start() {
     process.exit(1);
   });
 }
-
 async function shutdown(signal) {
   console.log(`\n[Server] Received ${signal} — initiating graceful shutdown`);
 
-  // Stop the cron job first — no new sweeps during shutdown
   if (expiryJob) {
     expiryJob.stop();
     console.log("[Server] Expiry job stopped");
+  }
+
+  if (orphanJob) {
+    orphanJob.stop();
+    console.log("[Server] Orphan job stopped");
   }
 
   server.close(async () => {

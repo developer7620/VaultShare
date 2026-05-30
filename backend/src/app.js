@@ -10,6 +10,7 @@ const healthRoutes = require("./routes/health.routes");
 const AppError = require("./utils/AppError");
 const fileRoutes = require("./routes/file.routes");
 const adminRoutes = require("./routes/admin.routes");
+const webhookRoutes = require("./routes/webhook.routes");
 
 const app = express();
 app.set("trust proxy", 1);
@@ -56,7 +57,8 @@ if (process.env.NODE_ENV !== "test") {
 // ─── Routes ────────────────────────────────────────────────────────────────
 app.use("/health", healthRoutes);
 app.use("/api/files", fileRoutes);
-app.use("/api/admin", adminRoutes);   // ← must be BEFORE the 404 handler
+app.use("/api/admin", adminRoutes);
+app.use("/api/webhooks", webhookRoutes);
 
 // ─── 404 handler ───────────────────────────────────────────────────────────
 app.use((req, res, next) => {
